@@ -4,6 +4,7 @@ import * as v8 from "v8";
 import metrics from "../middleware/metrics";
 import { logger } from "../utils/logger";
 import { env } from "../config/env";
+import { CACHE_SCHEMA_VERSION, cacheKeyPrefix } from "../constants";
 
 // ioredis is lazy-loaded only when REDIS_URL is present to avoid the ~40ms
 // module-parse cost during cold starts where Redis is not configured.
@@ -49,6 +50,43 @@ export interface CacheService {
 const COMPRESSION_PREFIX_GZIP = "__gz:";
 const COMPRESSION_PREFIX_BROTLI = "__br:";
 const COMPRESSION_THRESHOLD = env.CACHE_COMPRESSION_THRESHOLD;
+
+/**
+ * Whether the service may fall back to in-memory caching when Redis is
+ * unreachable. Defaults to true in development and false in strict prod.
+ */
+export const ALLOW_CACHE_FALLBACK: boolean =
+  process.env.ALLOW_CACHE_FALLBACK !== undefined
+    ? process.env.ALLOW_CACHE_FALLBACK === "true"
+    : env.NODE_ENV !== "production";
+
+/** Health status of the Redis backend. */
+export type RedisHealthStatus = "healthy" | "unhealthy" | "disabled";
+
+export interface CacheHealth {
+  backend: CacheService["backend"];
+  redis: RedisHealthStatus;
+  fallbackEnabled: boolean;
+  schemaVersion: string;
+}
+
+let _redisHealth: RedisHealthStatus = "disabled";
+
+/** Returns the current cache/Redis health snapshot for readiness checks. */
+export function getCacheHealth(): CacheHealth {
+  const backend = _cache ? _cache.backend : "memory";
+  return {
+    backend,
+    redis: _redisHealth,
+    fallbackEnabled: ALLOW_CACHE_FALLBACK,
+    schemaVersion: CACHE_SCHEMA_VERSION,
+  };
+}
+
+/** Marks the Redis backend healthy/unhealthy (used by event listeners). */
+export function setRedisHealth(status: RedisHealthStatus): void {
+  _redisHealth = status;
+}
 
 /** Milliseconds of the stale-while-revalidate window (from CACHE_SWR_MS env var) */
 export const CACHE_SWR_MS = parseInt(process.env.CACHE_SWR_MS ?? "0", 10) || 0;
@@ -372,7 +410,7 @@ class RedisCache implements CacheService {
   readonly staleWhileRevalidate: boolean;
 
   private readonly swrMs: number;
-  private readonly tagPrefix = "tag:contract:";
+  private readonly tagPrefix = cacheKeyPrefix("tag:contract:");
 
   constructor(
     private readonly client: RedisClient | ClusterClient,
@@ -399,7 +437,7 @@ class RedisCache implements CacheService {
       return null;
     }
     metrics.recordCacheOperation("redis", "get", "hit");
-    return JSON.parse(raw) as T;
+    return JSON.parse(decompressValue(raw)) as T;
   }
 
   async getWithMeta<T>(
@@ -416,7 +454,7 @@ class RedisCache implements CacheService {
       metrics.recordCacheOperation("redis", "get", "miss");
       return null;
     }
-    const value = JSON.parse(raw) as T;
+    const value = JSON.parse(decompressValue(raw)) as T;
     const isStale =
       this.staleWhileRevalidate && ttlMs >= 0 && ttlMs < this.swrMs;
     metrics.recordCacheOperation("redis", "get", isStale ? "hit" : "hit");
@@ -429,7 +467,7 @@ class RedisCache implements CacheService {
     const json = JSON.stringify(value);
     const finalValue = shouldCompress(json) ? compressValue(json) : json;
     // PX = millisecond precision TTL
-    await this.client.set(key, JSON.stringify(value), "PX", ttlMs);
+    await this.client.set(key, finalValue, "PX", ttlMs);
     metrics.recordCacheLatency("set", "redis", (Date.now() - start) / 1000);
 
     // Index contract IDs in Redis Sets
@@ -492,6 +530,33 @@ class RedisCache implements CacheService {
     return keys.length;
   }
 
+  /**
+   * Scan and delete all keys belonging to a given schema version.
+   * Uses SCAN (never KEYS) to avoid blocking the Redis server.
+   */
+  async flushVersion(version: string): Promise<number> {
+    const match = `sfe:${version}:*`;
+    let cursor = "0";
+    let deleted = 0;
+    do {
+      const [next, found] = await this.client.scan(
+        cursor,
+        "MATCH",
+        match,
+        "COUNT",
+        100,
+      );
+      cursor = next;
+      if (found.length > 0) {
+        const pipeline = this.client.pipeline();
+        for (const key of found) pipeline.del(key);
+        await pipeline.exec();
+        deleted += found.length;
+      }
+    } while (cursor !== "0");
+    return deleted;
+  }
+
   async close(): Promise<void> {
     try {
       await this.client.quit();
@@ -508,6 +573,7 @@ class RedisCache implements CacheService {
 let _cache: CacheService | null = null;
 let _reconnectTimer: NodeJS.Timeout | null = null;
 let _reconnectAttempts = 0;
+let _redisClient: RedisClient | ClusterClient | null = null;
 
 function buildRedisClient(): RedisClient | ClusterClient | null {
   const redisUrl = process.env.REDIS_URL;
@@ -585,28 +651,34 @@ export function getCache(): CacheService {
 
   if (client) {
     try {
-      const Redis = require("ioredis") as typeof import("ioredis").default;
-      const client = new Redis(redisUrl, {
-        connectTimeout: 2000,
-        maxRetriesPerRequest: 1,
-        enableOfflineQueue: false,
-        lazyConnect: false,
-        retryStrategy: (times: number) => {
-          if (times > 10) return null; // Stop retrying after 10 attempts
-          const delay = Math.min(times * 100, 3000); // Exponential backoff capped at 3s
-          return delay;
-        },
-      });
+      _redisClient = client;
+      const backendType: "redis" | "cluster" | "sentinel" =
+        process.env.REDIS_CLUSTER_NODES
+          ? "cluster"
+          : process.env.REDIS_SENTINEL_HOSTS
+            ? "sentinel"
+            : "redis";
 
       const scheduleFallback = () => {
-        logger.warn({ url: redisUrl }, "Redis unavailable — falling back to in-memory cache");
-        if (_cache && _cache.backend === "redis") {
+        setRedisHealth("unhealthy");
+        if (!ALLOW_CACHE_FALLBACK) {
+          logger.error(
+            "Redis unavailable and ALLOW_CACHE_FALLBACK is disabled — cache operations will fail",
+          );
+          return;
+        }
+        logger.warn(
+          "Redis unavailable — falling back to in-memory cache",
+        );
+        if (!_cache || _cache.backend !== "memory") {
           _cache = new AsyncLruMemoryCache();
         }
       };
 
+      // Attach the error listener immediately so an unreachable host never
+      // throws an unhandled 'error' event and crashes the Node process.
       client.on("error", (err: Error) => {
-        logger.warn({ err: err.message }, "Redis error — falling back to in-memory cache");
+        logger.warn({ err: err.message }, "Redis error — marking cache unhealthy");
         scheduleFallback();
       });
 
@@ -626,6 +698,7 @@ export function getCache(): CacheService {
 
       client.on("close", () => {
         logger.warn("Redis connection closed — scheduling reconnect");
+        setRedisHealth("unhealthy");
         // The retryStrategy handles reconnection; we just log
       });
 
@@ -635,17 +708,23 @@ export function getCache(): CacheService {
       // successful reconnection (ioredis handles reconnection automatically).
       client.on("ready", () => {
         logger.info("Redis cache ready — restoring Redis backend");
-        _cache = new RedisCache(client);
+        setRedisHealth("healthy");
+        _cache = new RedisCache(client, CACHE_SWR_MS, backendType);
       });
 
-      _cache = new RedisCache(client);
-      logger.info({ url: redisUrl }, "Cache backend: Redis");
+      // Non-blocking boot: assume Redis is healthy until the first error.
+      // ioredis connects in the background; we never await it here.
+      setRedisHealth("healthy");
+      _cache = new RedisCache(client, CACHE_SWR_MS, backendType);
+      logger.info({ backend: backendType }, "Cache backend: Redis");
     } catch (err) {
       logger.warn({ err }, "Failed to initialise Redis — falling back to in-memory cache");
+      setRedisHealth("unhealthy");
       _cache = new AsyncLruMemoryCache();
     }
   } else {
     _cache = new AsyncLruMemoryCache();
+    setRedisHealth("disabled");
     logger.info("Cache backend: in-memory LRU (REDIS_URL not set)");
   }
 
@@ -667,7 +746,22 @@ export async function closeCache(): Promise<void> {
   if (_cache instanceof RedisCache) {
     await _cache.close();
   }
+  _redisClient = null;
   _cache = null;
+  setRedisHealth("disabled");
+}
+
+/**
+ * Scan and delete all keys belonging to a given schema version.
+ * Used by the `cache:flush-version` CLI to purge obsolete namespaces.
+ */
+export async function flushCacheVersion(version: string): Promise<number> {
+  if (!_redisClient) {
+    logger.warn("flushCacheVersion called without an active Redis client");
+    return 0;
+  }
+  const redis = new RedisCache(_redisClient);
+  return redis.flushVersion(version);
 }
 
 // ---------------------------------------------------------------------------
@@ -688,4 +782,12 @@ export function buildCacheKey(data: Record<string, unknown>): string {
       }, {}),
   );
   return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Build a schema-versioned cache key: `sfe:${CACHE_SCHEMA_VERSION}:sim:<hash>`.
+ * Bumping CACHE_SCHEMA_VERSION isolates new entries from legacy shapes.
+ */
+export function buildVersionedCacheKey(data: Record<string, unknown>): string {
+  return cacheKeyPrefix(`sim:${buildCacheKey(data)}`);
 }

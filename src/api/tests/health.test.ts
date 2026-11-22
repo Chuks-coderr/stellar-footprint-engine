@@ -215,6 +215,80 @@ describe("Health Endpoints", () => {
       });
     });
 
+    it("should return 200 with degraded cache status when Redis is unhealthy but fallback is enabled", async () => {
+      // Mock cache as unhealthy (Redis down) but fallback enabled
+      const mockCache = {
+        backend: "memory" as const,
+        get: jest.fn().mockRejectedValue(new Error("Redis connection failed")),
+        set: jest.fn().mockRejectedValue(new Error("Redis connection failed")),
+        delete: jest.fn().mockResolvedValue(undefined),
+        flush: jest.fn().mockResolvedValue(undefined),
+      };
+      jest.spyOn(cacheModule, "getCache").mockReturnValue(mockCache);
+      jest
+        .spyOn(cacheModule, "isCacheFallbackEnabled")
+        .mockReturnValue(true);
+
+      // Mock circuit breaker as healthy
+      (rpcCircuitBreaker.getState as jest.Mock).mockReturnValue({
+        state: "closed",
+        failures: 0,
+      });
+
+      const response = await request(app).get("/api/health/ready");
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        status: "ready",
+        checks: {
+          cache: {
+            status: "degraded",
+            details: { error: "Redis connection failed" },
+          },
+          rpcCircuitBreaker: {
+            status: "healthy",
+          },
+        },
+      });
+    });
+
+    it("should return 503 when Redis is unhealthy and fallback is disabled", async () => {
+      // Mock cache as unhealthy (Redis down) with fallback disabled
+      const mockCache = {
+        backend: "redis" as const,
+        get: jest.fn().mockRejectedValue(new Error("Redis connection failed")),
+        set: jest.fn().mockRejectedValue(new Error("Redis connection failed")),
+        delete: jest.fn().mockResolvedValue(undefined),
+        flush: jest.fn().mockResolvedValue(undefined),
+      };
+      jest.spyOn(cacheModule, "getCache").mockReturnValue(mockCache);
+      jest
+        .spyOn(cacheModule, "isCacheFallbackEnabled")
+        .mockReturnValue(false);
+
+      // Mock circuit breaker as healthy
+      (rpcCircuitBreaker.getState as jest.Mock).mockReturnValue({
+        state: "closed",
+        failures: 0,
+      });
+
+      const response = await request(app).get("/api/health/ready");
+
+      expect(response.status).toBe(503);
+      expect(response.body).toMatchObject({
+        status: "not ready",
+        checks: {
+          cache: {
+            status: "unhealthy",
+            details: { error: "Redis connection failed" },
+          },
+          rpcCircuitBreaker: {
+            status: "healthy",
+          },
+        },
+      });
+    });
+
     it("should consider half-open circuit breaker as healthy", async () => {
       // Mock cache as healthy
       let storedValue: string | null = null;

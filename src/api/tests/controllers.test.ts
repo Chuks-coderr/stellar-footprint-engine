@@ -739,6 +739,70 @@ describe("POST /api/v1/restore validation", () => {
   });
 });
 
+// ── #60: DELETE /cache/contract/:contractId ────────────────────────────────
+
+describe("DELETE /api/v1/cache/contract/:contractId", () => {
+  const VALID_CONTRACT_ID =
+    "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE";
+  const ADMIN_KEY = "test-admin-key";
+
+  const originalAdminKey = process.env.ADMIN_API_KEY;
+
+  beforeEach(() => {
+    process.env.ADMIN_API_KEY = ADMIN_KEY;
+  });
+
+  afterEach(() => {
+    if (originalAdminKey === undefined) {
+      delete process.env.ADMIN_API_KEY;
+    } else {
+      process.env.ADMIN_API_KEY = originalAdminKey;
+    }
+  });
+
+  it("purges cached simulations for a valid contract and returns purgedKeysCount", async () => {
+    const res = await request(app)
+      .delete(`/api/v1/cache/contract/${VALID_CONTRACT_ID}`)
+      .set("X-Admin-Key", ADMIN_KEY);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      success: true,
+      purgedKeysCount: expect.any(Number),
+    });
+  });
+
+  it("returns 400 for an invalid contract address", async () => {
+    const res = await request(app)
+      .delete("/api/v1/cache/contract/not-a-valid-contract")
+      .set("X-Admin-Key", ADMIN_KEY);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({
+      success: false,
+      code: "INVALID_CONTRACT_ID",
+    });
+  });
+
+  it("returns 401 when no admin credentials are provided", async () => {
+    const res = await request(app).delete(
+      `/api/v1/cache/contract/${VALID_CONTRACT_ID}`,
+    );
+
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({ success: false });
+  });
+
+  it("returns 403 when an invalid admin key is provided", async () => {
+    const res = await request(app)
+      .delete(`/api/v1/cache/contract/${VALID_CONTRACT_ID}`)
+      .set("X-Admin-Key", "wrong-key");
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ success: false });
+  });
+});
+
 // ── Async webhook simulation & GET /simulate/jobs/:jobId ───────────────────
 
 describe("Async webhook simulation and job status", () => {

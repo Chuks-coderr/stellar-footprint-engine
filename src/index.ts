@@ -32,7 +32,7 @@ import { requestIdMiddleware } from "./middleware/requestId";
 import { requestLogger } from "./middleware/requestLogger";
 import { responseTimeMiddleware } from "./middleware/responseTime";
 import { timeoutMiddleware } from "./middleware/timeout";
-import { closeCache } from "./services/cache";
+import { closeCache, getCache } from "./services/cache";
 import { logger } from "./utils/logger";
 
 const app = express();
@@ -328,6 +328,28 @@ if (require.main === module) {
       process.send("ready");
     }
   });
+
+  // Warm the cache in the background. Redis initialization must never block
+  // server boot: if Redis is unreachable, the cache falls back to in-memory
+  // storage (when ALLOW_CACHE_FALLBACK is enabled) and the server keeps
+  // serving traffic. Errors are logged as warnings, never fatal.
+  void (async () => {
+    try {
+      const cache = await getCache();
+      if (cache.isRedisHealthy()) {
+        logger.info("Cache initialized with Redis backend");
+      } else {
+        logger.warn(
+          "Redis unavailable at startup; cache operating in fallback mode",
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err },
+        "Cache initialization failed; continuing with fallback cache",
+      );
+    }
+  })();
 
   // Attach WebSocket gateway on /ws (gracefully skipped if `ws` is not installed).
   const teardownWs = attachWsGateway(server);

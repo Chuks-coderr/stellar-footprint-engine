@@ -31,6 +31,11 @@ export const EnvSchema = z.object({
   CACHE_MAX_SIZE: z.coerce.number().int().positive().default(500),
   CACHE_HEAP_SAFETY_THRESHOLD: z.coerce.number().min(0.5).max(0.95).default(0.85),
   CACHE_EMERGENCY_TRIM_RATIO: z.coerce.number().min(0.1).max(0.5).default(0.25),
+  ALLOW_CACHE_FALLBACK: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((value) => (value === undefined ? undefined : value === "true")),
+  CACHE_SCHEMA_VERSION: z.string().default("1"),
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
   DECODE_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
@@ -164,6 +169,20 @@ export function validateEnv(raw: NodeJS.ProcessEnv): EnvConfig {
 }
 
 export const env: EnvConfig = validateEnv(process.env);
+
+/**
+ * Resolve whether the cache should fall back to in-memory storage when Redis
+ * is unavailable. Defaults to `true` in development/test and `false` in
+ * production unless `ALLOW_CACHE_FALLBACK` is explicitly set.
+ */
+export function resolveAllowCacheFallback(
+  config: EnvConfig = env,
+): boolean {
+  if (config.ALLOW_CACHE_FALLBACK !== undefined) {
+    return config.ALLOW_CACHE_FALLBACK;
+  }
+  return config.NODE_ENV !== "production";
+}
 
 /**
  * Parse the configured API keys into a Map of key -> scopes.

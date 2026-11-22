@@ -47,6 +47,38 @@ export const CACHE_TTL = {
 export const CACHE_TTL_MS =
   parseInt(process.env.CACHE_TTL_MS ?? "60000", 10) || 60000;
 
+/**
+ * Schema version for cached payloads. Bump this whenever the shape of a
+ * cached response changes so that incompatible legacy entries are isolated
+ * (and can be purged with `pnpm run cache:flush-version <version>`).
+ */
+export const CACHE_SCHEMA_VERSION = "v2";
+
+/** Root namespace for all Redis keys written by this service. */
+export const CACHE_KEY_ROOT = "sfe";
+
+/** Prefix shared by every simulation cache key: `sfe:<version>:sim:`. */
+export const SIMULATION_CACHE_KEY_PREFIX = `${CACHE_KEY_ROOT}:${CACHE_SCHEMA_VERSION}:sim:`;
+
+/**
+ * Build a fully namespaced simulation cache key.
+ * Result shape: `sfe:${CACHE_SCHEMA_VERSION}:sim:<suffix>`.
+ */
+export function buildSimulationCacheKey(suffix: string): string {
+  return `${SIMULATION_CACHE_KEY_PREFIX}${suffix}`;
+}
+
+/**
+ * Build the key prefix for an arbitrary schema version, used by the
+ * cache-flush utility to scan and delete obsolete versioned keys.
+ */
+export function buildCacheKeyPrefix(
+  version: string,
+  namespace = "sim",
+): string {
+  return `${CACHE_KEY_ROOT}:${version}:${namespace}:`;
+}
+
 /** Simulation result LRU cache — configurable via env vars */
 export const SIMULATION_CACHE_TTL_MS =
   (parseInt(process.env.CACHE_TTL_SECONDS ?? "60", 10) || 60) * 1000;

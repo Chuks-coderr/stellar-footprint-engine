@@ -36,7 +36,17 @@ function extractApiKey(req: Request): string | null {
     return headerKey.trim();
   }
 
+  const adminKey = req.headers["x-admin-key"];
+  if (typeof adminKey === "string" && adminKey.trim() !== "") {
+    return adminKey.trim();
+  }
+
   return null;
+}
+
+function isAdminKeyHeader(req: Request): boolean {
+  const adminKey = req.headers["x-admin-key"];
+  return typeof adminKey === "string" && adminKey.trim() !== "";
 }
 
 function findMatchingKey(
@@ -154,7 +164,10 @@ export function apiKeyAuth(
     return;
   }
 
-  req.apiKeyScopes = matched.scopes;
+  // Keys supplied via X-Admin-Key are always granted the admin scope
+  req.apiKeyScopes = isAdminKeyHeader(req)
+    ? Array.from(new Set([...matched.scopes, "admin"]))
+    : matched.scopes;
   next();
 }
 

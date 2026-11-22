@@ -1,7 +1,12 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 
 import * as stellarConfig from "../../config/stellar";
-import { fetchTtlInfo, simulateViaRpc } from "../rpcClient";
+import {
+  fetchTtlInfo,
+  parseRpcUrls,
+  resetRpcPool,
+  simulateViaRpc,
+} from "../rpcClient";
 import { parseXdr } from "../xdrParser";
 
 jest.mock("../../config/stellar", () => ({
@@ -87,6 +92,113 @@ describe("rpcClient & xdrParser", () => {
         signal: undefined,
         ledger: 900,
       });
+    });
+  });
+
+  describe("parseRpcUrls", () => {
+    it("splits comma-separated URLs and trims whitespace", () => {
+      expect(
+        parseRpcUrls("https://a.example.com, https://b.example.com ,https://c.example.com"),
+      ).toEqual([
+        "https://a.example.com",
+        "https://b.example.com",
+        "https://c.example.com",
+      ]);
+    });
+
+    it("accepts arrays and drops empty entries", () => {
+      expect(
+        parseRpcUrls(["https://a.example.com", "", "  ", "https://b.example.com"]),
+      ).toEqual(["https://a.example.com", "https://b.example.com"]);
+    });
+
+    it("returns an empty array for undefined or empty input", () => {
+      expect(parseRpcUrls(undefined)).toEqual([]);
+      expect(parseRpcUrls("")).toEqual([]);
+      expect(parseRpcUrls(" , , ")).toEqual([]);
+    });
+  });
+
+  describe("latency-weighted routing", () => {
+    beforeEach(() => {
+      resetRpcPool();
+    });
+
+    afterEach(() => {
+      resetRpcPool();
+    });
+
+    it("routes traffic proportionally towards the lowest-latency endpoint", async () => {
+      const fastSimulate = jest.fn().mockResolvedValue({ id: "fast" });
+      const slowSimulate = jest.fn().mockResolvedValue({ id: "slow" });
+
+      mockedGetRpcServer.mockImplementation((network?: string) => {
+        const url = network ?? "";
+        if (url.includes("fast")) {
+          return {
+            simulateTransaction: fastSimulate,
+            getLedgerEntries: mockGetLedgerEntries,
+          } as unknown as StellarSdk.rpc.Server;
+        }
+        return {
+          simulateTransaction: slowSimulate,
+          getLedgerEntries: mockGetLedgerEntries,
+        } as unknown as StellarSdk.rpc.Server;
+      });
+
+      // Seed latency samples: fast endpoint ~1ms, slow endpoint ~50ms.
+      const fastServer = mockedGetRpcServer("https://fast.example.com");
+      const slowServer = mockedGetRpcServer("https://slow.example.com");
+      expect(fastServer).toBeDefined();
+      expect(slowServer).toBeDefined();
+
+      const tx = createSampleTx();
+      const counts: Record<string, number> = { fast: 0, slow: 0 };
+
+      for (let i = 0; i < 40; i += 1) {
+        const res = (await simulateViaRpc(tx, "testnet")) as { id: string };
+        counts[res.id] += 1;
+      }
+
+      expect(counts.fast + counts.slow).toBe(40);
+      // Latency-weighted selection should favor the faster endpoint.
+      expect(counts.fast).toBeGreaterThan(counts.slow);
+    });
+
+    it("penalizes endpoints that return 5xx errors", async () => {
+      const healthySimulate = jest.fn().mockResolvedValue({ id: "healthy" });
+      const failingSimulate = jest
+        .fn()
+        .mockRejectedValue(Object.assign(new Error("boom"), { status: 503 }));
+
+      mockedGetRpcServer.mockImplementation((network?: string) => {
+        const url = network ?? "";
+        if (url.includes("healthy")) {
+          return {
+            simulateTransaction: healthySimulate,
+            getLedgerEntries: mockGetLedgerEntries,
+          } as unknown as StellarSdk.rpc.Server;
+        }
+        return {
+          simulateTransaction: failingSimulate,
+          getLedgerEntries: mockGetLedgerEntries,
+        } as unknown as StellarSdk.rpc.Server;
+      });
+
+      const tx = createSampleTx();
+      let healthyCount = 0;
+
+      for (let i = 0; i < 20; i += 1) {
+        try {
+          const res = (await simulateViaRpc(tx, "testnet")) as { id: string };
+          if (res.id === "healthy") healthyCount += 1;
+        } catch {
+          // Failures are expected from the degraded endpoint.
+        }
+      }
+
+      // The healthy endpoint should receive the bulk of traffic.
+      expect(healthyCount).toBeGreaterThan(10);
     });
   });
 

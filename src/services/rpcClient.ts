@@ -27,6 +27,198 @@ interface StatsEntry {
 
 const rpcStats = new Map<string, StatsEntry>();
 
+// ---------------------------------------------------------------------------
+// #61 — Dynamic RPC endpoint pool with latency-weighted round-robin
+// ---------------------------------------------------------------------------
+
+/** Number of recent latency samples kept per endpoint for the moving average. */
+const LATENCY_WINDOW = 10;
+
+/** Latency assumed for an endpoint that has no samples yet (ms). */
+const DEFAULT_LATENCY_MS = 100;
+
+/** Multiplier applied to an endpoint's effective latency after a penalty. */
+const PENALTY_MULTIPLIER = 4;
+
+/** How long (ms) a penalty remains in effect before decaying. */
+const PENALTY_TTL_MS = 30_000;
+
+interface EndpointState {
+  network: string;
+  url: string;
+  /** Rolling window of the most recent request latencies (ms). */
+  latencies: number[];
+  /** Timestamp until which the endpoint is penalized (0 = not penalized). */
+  penalizedUntil: number;
+  /** Weighted round-robin accumulator. */
+  currentWeight: number;
+}
+
+const endpointPool = new Map<string, EndpointState>();
+
+function endpointKey(network: string, url: string): string {
+  return `${network}::${url}`;
+}
+
+function isDebugEnabled(): boolean {
+  const flag = process.env.RPC_DEBUG ?? process.env.DEBUG;
+  return flag === "1" || flag === "true";
+}
+
+function debugLog(message: string): void {
+  if (isDebugEnabled()) {
+    // eslint-disable-next-line no-console
+    console.log(`[rpc-pool] ${message}`);
+  }
+}
+
+/**
+ * Parse a comma-separated list of RPC URLs into a trimmed, de-duplicated array.
+ */
+export function parseRpcUrls(raw: string | undefined | null): string[] {
+  if (!raw) return [];
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const part of raw.split(",")) {
+    const url = part.trim();
+    if (url && !seen.has(url)) {
+      seen.add(url);
+      urls.push(url);
+    }
+  }
+  return urls;
+}
+
+/**
+ * Resolve the configured RPC URLs for a network. Supports comma-separated
+ * values in the per-network env var (e.g. `TESTNET_RPC_URL`) as well as the
+ * generic `STELLAR_RPC_URL` fallback.
+ */
+export function getRpcUrls(network: Network): string[] {
+  const perNetworkEnv: Record<string, string | undefined> = {
+    testnet: process.env.TESTNET_RPC_URL,
+    mainnet: process.env.MAINNET_RPC_URL,
+    futurenet: process.env.FUTURENET_RPC_URL,
+  };
+
+  const candidates = [
+    ...parseRpcUrls(perNetworkEnv[network]),
+    ...parseRpcUrls(process.env.STELLAR_RPC_URL),
+  ];
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const url of candidates) {
+    if (!seen.has(url)) {
+      seen.add(url);
+      result.push(url);
+    }
+  }
+  return result;
+}
+
+function getOrCreateEndpoint(network: string, url: string): EndpointState {
+  const key = endpointKey(network, url);
+  let state = endpointPool.get(key);
+  if (!state) {
+    state = {
+      network,
+      url,
+      latencies: [],
+      penalizedUntil: 0,
+      currentWeight: 0,
+    };
+    endpointPool.set(key, state);
+  }
+  return state;
+}
+
+/**
+ * Compute the effective latency used for weighting. Endpoints without samples
+ * use a default; penalized endpoints get a multiplied latency so they receive
+ * proportionally less traffic.
+ */
+function effectiveLatency(state: EndpointState, now: number): number {
+  const base =
+    state.latencies.length > 0
+      ? state.latencies.reduce((a, b) => a + b, 0) / state.latencies.length
+      : DEFAULT_LATENCY_MS;
+  const penalized = state.penalizedUntil > now;
+  return penalized ? base * PENALTY_MULTIPLIER : base;
+}
+
+/**
+ * Select the next endpoint for a network using latency-weighted round-robin.
+ * Returns `undefined` when no endpoints are configured.
+ */
+export function selectRpcEndpoint(network: Network): string | undefined {
+  const urls = getRpcUrls(network);
+  if (urls.length === 0) return undefined;
+  if (urls.length === 1) return urls[0];
+
+  const now = Date.now();
+  const states = urls.map((url) => getOrCreateEndpoint(network, url));
+
+  // Weight is inversely proportional to effective latency.
+  let totalWeight = 0;
+  const weights = states.map((state) => {
+    const weight = 1 / Math.max(effectiveLatency(state, now), 1);
+    totalWeight += weight;
+    return weight;
+  });
+
+  // Smooth weighted round-robin: add each weight to its accumulator and pick
+  // the endpoint with the highest accumulator, then subtract the total.
+  let selectedIndex = 0;
+  let best = -Infinity;
+  for (let i = 0; i < states.length; i++) {
+    states[i].currentWeight += weights[i];
+    if (states[i].currentWeight > best) {
+      best = states[i].currentWeight;
+      selectedIndex = i;
+    }
+  }
+  states[selectedIndex].currentWeight -= totalWeight;
+
+  const selected = states[selectedIndex];
+  debugLog(
+    `network=${network} selected=${sanitizeRpcUrl(selected.url)} ` +
+      `avgLatency=${effectiveLatency(selected, now).toFixed(1)}ms ` +
+      `penalized=${selected.penalizedUntil > now}`,
+  );
+  return selected.url;
+}
+
+/**
+ * Record the outcome of a request against a specific endpoint, updating the
+ * rolling latency window and applying penalties for failures/timeouts.
+ */
+export function recordEndpointResult(
+  network: Network,
+  url: string,
+  latencyMs: number,
+  failed: boolean,
+): void {
+  const state = getOrCreateEndpoint(network, url);
+  state.latencies.push(latencyMs);
+  if (state.latencies.length > LATENCY_WINDOW) {
+    state.latencies.shift();
+  }
+  if (failed) {
+    state.penalizedUntil = Date.now() + PENALTY_TTL_MS;
+    debugLog(
+      `network=${network} penalized=${sanitizeRpcUrl(url)} for ${PENALTY_TTL_MS}ms`,
+    );
+  }
+}
+
+/**
+ * Reset the endpoint pool. Intended for tests.
+ */
+export function resetRpcPool(): void {
+  endpointPool.clear();
+}
+
 /**
  * Sanitize a URL by masking credentials and sensitive query parameters.
  * - Masks basic-auth user:pass in the URL authority.
@@ -136,12 +328,27 @@ export async function simulateViaRpc(
   signal?: AbortSignal,
   ledgerSequence?: number,
 ): Promise<StellarSdk.rpc.Api.SimulateTransactionResponse> {
-  const server = getRpcServer(network);
   const simOptions: Record<string, unknown> = { signal };
   if (ledgerSequence !== undefined) {
     simOptions.ledger = ledgerSequence;
   }
-  return server.simulateTransaction(tx, simOptions as never);
+
+  const selectedUrl = selectRpcEndpoint(network);
+  if (!selectedUrl) {
+    const server = getRpcServer(network);
+    return server.simulateTransaction(tx, simOptions as never);
+  }
+
+  const server = new StellarSdk.rpc.Server(selectedUrl);
+  const startedAt = Date.now();
+  try {
+    const response = await server.simulateTransaction(tx, simOptions as never);
+    recordEndpointResult(network, selectedUrl, Date.now() - startedAt, false);
+    return response;
+  } catch (error) {
+    recordEndpointResult(network, selectedUrl, Date.now() - startedAt, true);
+    throw error;
+  }
 }
 
 /**
@@ -157,14 +364,21 @@ export async function fetchTtlInfo(
     return {};
   }
 
-  const server = getRpcServer(network);
+  const selectedUrl = selectRpcEndpoint(network);
+  const server = selectedUrl
+    ? new StellarSdk.rpc.Server(selectedUrl)
+    : getRpcServer(network);
 
   try {
     const ledgerKeys = footprintEntries.map((xdr) => {
       return StellarSdk.xdr.LedgerKey.fromXDR(xdr, "base64");
     });
 
+    const startedAt = Date.now();
     const response = await server.getLedgerEntries(...ledgerKeys);
+    if (selectedUrl) {
+      recordEndpointResult(network, selectedUrl, Date.now() - startedAt, false);
+    }
     const ttlMap: Record<
       string,
       { liveUntilLedger: number; expiresInLedgers: number }
@@ -190,6 +404,9 @@ export async function fetchTtlInfo(
 
     return ttlMap;
   } catch {
+    if (selectedUrl) {
+      recordEndpointResult(network, selectedUrl, 0, true);
+    }
     return {};
   }
 }

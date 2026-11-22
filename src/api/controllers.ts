@@ -2,7 +2,11 @@ import path from "path";
 
 import { Network } from "@config/stellar";
 import metrics from "@middleware/metrics";
-import { getCache, invalidateContractCache } from "@services/cache";
+import {
+  getCache,
+  getCacheStatus,
+  invalidateContractCache,
+} from "@services/cache";
 import { decodeXdr, type XdrType } from "@services/decoder";
 import {
   estimateFee,
@@ -79,22 +83,39 @@ export async function readiness(
     const checks: Record<string, { status: string; details?: unknown }> = {};
 
     // Check Redis/Cache
+    let cacheFallbackEnabled = false;
     try {
       const cache = getCache();
+      const status = getCacheStatus();
+      cacheFallbackEnabled = status.fallbackEnabled;
+
       const testKey = "__health_check__";
       const testValue = Date.now().toString();
       await cache.set(testKey, testValue, 5000);
       const retrieved = await cache.get<string>(testKey);
       await cache.delete(testKey);
 
+      const cacheHealthy = retrieved === testValue;
+
       checks.cache = {
-        status: retrieved === testValue ? "healthy" : "unhealthy",
-        details: { backend: cache.backend },
+        status: cacheHealthy
+          ? "healthy"
+          : cacheFallbackEnabled
+            ? "degraded"
+            : "unhealthy",
+        details: {
+          backend: cache.backend,
+          redisStatus: status.redisStatus,
+          fallbackEnabled: status.fallbackEnabled,
+        },
       };
     } catch (err) {
       checks.cache = {
-        status: "unhealthy",
-        details: { error: (err as Error).message },
+        status: cacheFallbackEnabled ? "degraded" : "unhealthy",
+        details: {
+          error: (err as Error).message,
+          fallbackEnabled: cacheFallbackEnabled,
+        },
       };
     }
 
@@ -105,14 +126,20 @@ export async function readiness(
       details: cbState,
     };
 
-    // Determine overall health
+    // Determine overall health. A degraded cache is tolerated when fallback
+    // is enabled so the service can keep serving traffic.
     const allHealthy = Object.values(checks).every(
-      (check) => check.status === "healthy",
+      (check) =>
+        check.status === "healthy" ||
+        (check.status === "degraded" && cacheFallbackEnabled),
+    );
+    const anyDegraded = Object.values(checks).some(
+      (check) => check.status === "degraded",
     );
 
     if (allHealthy) {
       res.status(HTTP_STATUS.OK).json({
-        status: "ready",
+        status: anyDegraded ? "ready (degraded)" : "ready",
         checks,
         timestamp: new Date().toISOString(),
       });
@@ -623,17 +650,43 @@ export async function invalidateContractCacheController(
       );
     }
 
+    if (!isValidContractId(contractId)) {
+      return next(
+        new AppError(
+          "Invalid contract ID: must be a valid Stellar contract StrKey",
+          HTTP_STATUS.BAD_REQUEST,
+        ),
+      );
+    }
+
     const count = await invalidateContractCache(contractId);
     res.status(HTTP_STATUS.OK).json({
-      message: `Invalidated ${count} cache entries for contract ${contractId}`,
-      contractId,
-      invalidatedCount: count,
+      success: true,
+      purgedKeysCount: count,
     });
   } catch (err: unknown) {
     const message =
       err instanceof Error ? err.message : ERROR_MESSAGES.UNEXPECTED_ERROR;
     next(new AppError(message, HTTP_STATUS.INTERNAL_SERVER_ERROR));
   }
+}
+
+/**
+ * Validate a Stellar contract ID (StrKey, "C..." format).
+ * Uses the Stellar SDK when available and falls back to a structural check.
+ */
+function isValidContractId(contractId: string): boolean {
+  try {
+    const StellarSdk = require("@stellar/stellar-sdk") as {
+      StrKey?: { isValidContract: (value: string) => boolean };
+    };
+    if (StellarSdk?.StrKey?.isValidContract) {
+      return StellarSdk.StrKey.isValidContract(contractId);
+    }
+  } catch {
+    // fall through to structural validation
+  }
+  return /^C[A-Z2-7]{55}$/.test(contractId);
 }
 
 export async function estimateFeeController(

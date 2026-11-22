@@ -23,18 +23,65 @@ Cache backend: Redis
 Cache backend: in-memory LRU (REDIS_URL not set)
 ```
 
+### Zero-downtime fallback (`ALLOW_CACHE_FALLBACK`)
+
+Redis initialization is **non-blocking**: the server boots and serves traffic even if the Redis host is invalid, offline, or unreachable at startup. Redis connection errors are captured by an `error` event listener that marks the Redis status as `unhealthy` instead of crashing the Node process.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALLOW_CACHE_FALLBACK` | `true` in development, `false` in production | When `true`, the service keeps serving requests using the in-memory LRU cache while Redis is unavailable. When `false`, Redis failures are treated as fatal in strict production mode. |
+
+When fallback is active, the service logs a warning such as:
+
+```
+[warn] Redis unavailable — falling back to in-memory cache
+```
+
+The readiness probe `GET /health/ready` reports Redis connectivity accurately:
+
+- Redis reachable → `redis: "healthy"`, overall status `ready`.
+- Redis unreachable with `ALLOW_CACHE_FALLBACK=true` → `redis: "degraded"`, but the service still reports ready and serves traffic.
+- Redis unreachable with `ALLOW_CACHE_FALLBACK=false` → readiness fails.
+
 ---
 
 ## Cache Key Structure
 
-Cache keys are deterministic SHA-256 hashes of the request's canonical JSON (keys sorted alphabetically):
+Cache keys are deterministic SHA-256 hashes of the request's canonical JSON (keys sorted alphabetically), namespaced by the current cache schema version:
 
 ```
-sha256(JSON.stringify({ network: "testnet", xdr: "AAAAAgAAAAC..." }))
-→ "a3f2c1d9e8b7..."
+sfe:<CACHE_SCHEMA_VERSION>:sim:sha256(JSON.stringify({ network: "testnet", xdr: "AAAAAgAAAAC..." }))
+→ "sfe:v2:sim:a3f2c1d9e8b7..."
 ```
 
 This means two requests with the same XDR and network always hit the same cache entry, regardless of field order in the request body.
+
+### Schema versioning policy
+
+`CACHE_SCHEMA_VERSION` (defined in `src/constants.ts`) is embedded in every Redis key prefix as `sfe:${CACHE_SCHEMA_VERSION}:sim:...`.
+
+**Bump the version whenever the cached response shape changes incompatibly**, for example:
+
+- Adding or removing fields in the simulation response envelope
+- Changing envelope shapes or field types
+- Changing the serialization format of cached values
+
+Bumping the version automatically isolates the cache from incompatible legacy entries: new writes go to the new namespace, and old entries are never read (they simply expire via TTL). This prevents deserialization errors or incomplete responses for clients after a schema change.
+
+**Bump procedure:**
+
+1. Update `CACHE_SCHEMA_VERSION` in `src/constants.ts` (e.g. `'v2'` → `'v3'`).
+2. Deploy the service. New keys are written under the new prefix; legacy keys are ignored.
+3. Optionally reclaim memory immediately by deleting obsolete keys:
+
+   ```bash
+   pnpm run cache:flush-version v2
+   ```
+
+   The utility uses Redis `SCAN` (never `KEYS`) to iterate keys matching `sfe:v2:*` in batches and deletes them, so it is safe to run against a live production Redis.
+
+4. Confirm the active namespace in the startup log and via `GET /health/ready`.
+=======
 
 ---
 

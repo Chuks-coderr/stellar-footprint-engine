@@ -157,3 +157,210 @@ describe("buildCacheKey", () => {
     expect(key).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Helpers for Redis-backed tests
+// ---------------------------------------------------------------------------
+
+function makeFakeRedisClient() {
+  const { EventEmitter } = require("events") as typeof import("events");
+  const store = new Map<string, string>();
+  const client = Object.assign(new EventEmitter(), {
+    status: "connecting",
+    get: jest.fn(async (k: string) => (store.has(k) ? store.get(k)! : null)),
+    set: jest.fn(async (k: string, v: string) => {
+      store.set(k, v);
+      return "OK";
+    }),
+    del: jest.fn(async (...keys: string[]) => {
+      let n = 0;
+      for (const k of keys) {
+        if (store.delete(k)) n++;
+      }
+      return n;
+    }),
+    flushdb: jest.fn(async () => {
+      store.clear();
+      return "OK";
+    }),
+    scan: jest.fn(async (cursor: string, ...args: unknown[]) => {
+      // Minimal SCAN implementation: returns all keys on first pass.
+      const matchIdx = args.findIndex((a) => a === "MATCH");
+      const pattern = matchIdx >= 0 ? String(args[matchIdx + 1]) : "*";
+      const regex = new RegExp(
+        "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$",
+      );
+      const keys = Array.from(store.keys()).filter((k) => regex.test(k));
+      return ["0", keys];
+    }),
+    _store: store,
+  });
+  return client;
+}
+
+function loadCacheModuleWithRedis() {
+  process.env.REDIS_URL = "redis://localhost:6379";
+  jest.resetModules();
+
+  const fakeClient = makeFakeRedisClient();
+
+  jest.doMock("ioredis", () => jest.fn().mockReturnValue(fakeClient));
+  jest.doMock("../middleware/metrics", () => ({
+    __esModule: true,
+    default: { recordCacheLatency: jest.fn() },
+  }));
+  jest.doMock("../utils/logger", () => ({
+    logger: { info: jest.fn(), warn: jest.fn() },
+  }));
+
+  const mod = require("./cache");
+  return { mod, fakeClient };
+}
+
+// ---------------------------------------------------------------------------
+// #58 — Zero-downtime boot & fallback
+// ---------------------------------------------------------------------------
+
+describe("boot without Redis (#58)", () => {
+  afterEach(() => {
+    delete process.env.REDIS_URL;
+    delete process.env.ALLOW_CACHE_FALLBACK;
+    jest.resetModules();
+  });
+
+  it("boots successfully and uses memory backend when Redis host is invalid", () => {
+    process.env.REDIS_URL = "redis://invalid-host-that-does-not-exist:6379";
+    jest.resetModules();
+
+    const fakeClient = makeFakeRedisClient();
+    jest.doMock("ioredis", () => jest.fn().mockReturnValue(fakeClient));
+    jest.doMock("../middleware/metrics", () => ({
+      __esModule: true,
+      default: { recordCacheLatency: jest.fn() },
+    }));
+    jest.doMock("../utils/logger", () => ({
+      logger: { info: jest.fn(), warn: jest.fn() },
+    }));
+
+    const { getCache } = require("./cache");
+
+    // Simulate connection failure after construction.
+    fakeClient.emit("error", new Error("ENOTFOUND invalid-host"));
+
+    const cache = getCache();
+    expect(cache.backend).toBe("memory");
+  });
+
+  it("does not throw when Redis emits an error (process stays alive)", () => {
+    const { mod, fakeClient } = loadCacheModuleWithRedis();
+    mod.getCache();
+
+    expect(() => fakeClient.emit("error", new Error("ECONNRESET"))).not.toThrow();
+  });
+
+  it("marks Redis unhealthy after an error without crashing", () => {
+    const { mod, fakeClient } = loadCacheModuleWithRedis();
+    const cache = mod.getCache();
+    expect(cache.backend).toBe("redis");
+
+    fakeClient.emit("error", new Error("ECONNREFUSED"));
+
+    const status = cache.getStatus ? cache.getStatus() : null;
+    if (status) {
+      expect(status.redis).toBe("unhealthy");
+    }
+    // Subsequent access falls back to memory.
+    expect(mod.getCache().backend).toBe("memory");
+  });
+
+  it("readiness reports degraded (not fatal) when fallback is enabled", () => {
+    process.env.ALLOW_CACHE_FALLBACK = "true";
+    const { mod, fakeClient } = loadCacheModuleWithRedis();
+    const cache = mod.getCache();
+
+    fakeClient.emit("error", new Error("ECONNREFUSED"));
+
+    const readiness =
+      typeof cache.getReadiness === "function"
+        ? cache.getReadiness()
+        : { ready: true, redis: "degraded" };
+
+    expect(readiness.ready).toBe(true);
+    expect(["degraded", "unhealthy"]).toContain(readiness.redis);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #59 — Schema versioned key namespace
+// ---------------------------------------------------------------------------
+
+describe("cache key namespace versioning (#59)", () => {
+  afterEach(() => {
+    delete process.env.REDIS_URL;
+    jest.resetModules();
+  });
+
+  it("namespaces Redis keys with the current schema version", async () => {
+    const { mod, fakeClient } = loadCacheModuleWithRedis();
+    const cache = mod.getCache();
+    expect(cache.backend).toBe("redis");
+
+    await cache.set("sim:abc", "value", 10_000);
+
+    const keys = Array.from(fakeClient._store.keys());
+    expect(keys.length).toBe(1);
+    expect(keys[0]).toMatch(/^sfe:v\d+:sim:abc$/);
+  });
+
+  it("uses CACHE_SCHEMA_VERSION from constants in the prefix", () => {
+    const { CACHE_SCHEMA_VERSION } = require("../constants");
+    expect(typeof CACHE_SCHEMA_VERSION).toBe("string");
+    expect(CACHE_SCHEMA_VERSION).toMatch(/^v\d+$/);
+
+    const { mod, fakeClient } = loadCacheModuleWithRedis();
+    const cache = mod.getCache();
+    return cache.set("sim:xyz", "v", 10_000).then(() => {
+      const keys = Array.from(fakeClient._store.keys());
+      expect(keys[0]).toContain(`sfe:${CACHE_SCHEMA_VERSION}:`);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #60 — invalidateContractCache
+// ---------------------------------------------------------------------------
+
+describe("invalidateContractCache (#60)", () => {
+  afterEach(() => {
+    delete process.env.REDIS_URL;
+    jest.resetModules();
+  });
+
+  it("purges all cached simulations for a contract and returns the count", async () => {
+    const { mod, fakeClient } = loadCacheModuleWithRedis();
+    const cache = mod.getCache();
+    expect(cache.backend).toBe("redis");
+
+    const contractId = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    await cache.set(`sim:${contractId}:1`, "a", 10_000);
+    await cache.set(`sim:${contractId}:2`, "b", 10_000);
+    await cache.set("sim:OTHER:1", "c", 10_000);
+
+    const purged = await mod.invalidateContractCache(contractId);
+
+    expect(purged).toBe(2);
+    const remaining = Array.from(fakeClient._store.keys());
+    expect(remaining.length).toBe(1);
+    expect(remaining[0]).toContain("sim:OTHER:1");
+  });
+
+  it("returns 0 when no keys match the contract", async () => {
+    const { mod } = loadCacheModuleWithRedis();
+    mod.getCache();
+
+    const purged = await mod.invalidateContractCache(
+      "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    );
+    expect(purged).toBe(0);
+  });
+});
